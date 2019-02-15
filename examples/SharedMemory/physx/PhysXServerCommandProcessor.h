@@ -2,8 +2,14 @@
 #define PHYSX_SERVER_COMMAND_PROCESSOR_H
 
 #include "../PhysicsCommandProcessorInterface.h"
+#include "PxSimulationEventCallback.h"
+#include <stdio.h>
+#include <vector>
+#include <tuple>
+#include <mutex>
+using namespace physx;
 
-class PhysXServerCommandProcessor : public PhysicsCommandProcessorInterface
+class PhysXServerCommandProcessor : public PhysicsCommandProcessorInterface, public PxSimulationEventCallback
 {
 	struct PhysXServerCommandProcessorInternalData* m_data;
 
@@ -20,12 +26,40 @@ class PhysXServerCommandProcessor : public PhysicsCommandProcessorInterface
 	bool processSendDesiredStateCommand(const struct SharedMemoryCommand& clientCmd, struct SharedMemoryStatus& serverStatusOut, char* bufferServerToClient, int bufferSizeInBytes);
 	bool processChangeDynamicsInfoCommand(const struct SharedMemoryCommand& clientCmd, struct SharedMemoryStatus& serverStatusOut, char* bufferServerToClient, int bufferSizeInBytes);
 	bool processRequestPhysicsSimulationParametersCommand(const struct SharedMemoryCommand& clientCmd, struct SharedMemoryStatus& serverStatusOut, char* bufferServerToClient, int bufferSizeInBytes);
-
-
+	bool processRequestContactpointInformationCommand(const struct SharedMemoryCommand& clientCmd, struct SharedMemoryStatus& serverStatusOut, char* bufferServerToClient, int bufferSizeInBytes);
 	bool processCustomCommand(const struct SharedMemoryCommand& clientCmd, struct SharedMemoryStatus& serverStatusOut, char* bufferServerToClient, int bufferSizeInBytes);
 
 	void resetSimulation();
 	bool processStateLoggingCommand(const struct SharedMemoryCommand& clientCmd, struct SharedMemoryStatus& serverStatusOut, char* bufferServerToClient, int bufferSizeInBytes);
+
+	// PxSimulationEventCallback
+	void onContact(const PxContactPairHeader& pairHeader, const PxContactPair* pairs, PxU32 nbPairs);
+	void onConstraintBreak(PxConstraintInfo* constraints, PxU32 count)
+	{
+		PX_UNUSED(constraints);
+		PX_UNUSED(count);
+	}
+
+	void onWake(PxActor** actors, PxU32 count)
+	{
+		PX_UNUSED(actors);
+		PX_UNUSED(count);
+	}
+
+	void onSleep(PxActor** actors, PxU32 count)
+	{
+		PX_UNUSED(actors);
+		PX_UNUSED(count);
+	}
+
+	void onTrigger(PxTriggerPair* pairs, PxU32 count)
+	{
+		PX_UNUSED(pairs);
+		PX_UNUSED(count);
+	}
+
+	void onAdvance(const PxRigidBody* const*, const PxTransform*, const PxU32) {}
+
 public:
 	PhysXServerCommandProcessor();
 
@@ -47,6 +81,9 @@ public:
 	virtual void setTimeOut(double timeOutInSeconds) {}
 
 	virtual void reportNotifications() {}
+	std::vector<std::tuple<std::string, std::string, PxContactPairPoint>> contactPoints;
+	std::recursive_mutex contacts_lock;
+
 };
 
 #endif  //PHYSX_SERVER_COMMAND_PROCESSOR_H

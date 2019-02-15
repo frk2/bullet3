@@ -31,7 +31,7 @@
 #include "../Extras/Serialize/BulletFileLoader/btBulletFile.h"
 #include "LinearMath/btSerializer.h"
 #include "PhysXUserData.h"
-
+#include <iostream>
 class MyPhysXErrorCallback : public physx::PxErrorCallback
 {
 public:
@@ -158,13 +158,37 @@ physx::PxFilterFlags MyPhysXFilter(physx::PxFilterObjectAttributes attributes0, 
 	PX_UNUSED(attributes1);
 	PX_UNUSED(constantBlock);
 	PX_UNUSED(constantBlockSize);
-	if (filterData0.word2 != 0 && filterData0.word2 == filterData1.word2)
-		return physx::PxFilterFlag::eKILL;
-	pairFlags |= physx::PxPairFlag::eCONTACT_DEFAULT;
+	// if (filterData0.word2 != 0 && filterData0.word2 == filterData1.word2)
+	// 	return physx::PxFilterFlag::eKILL;
+	pairFlags |= physx::PxPairFlag::eCONTACT_DEFAULT | PxPairFlag::eNOTIFY_TOUCH_FOUND
+              | PxPairFlag::eDETECT_DISCRETE_CONTACT | PxPairFlag::eNOTIFY_CONTACT_POINTS;
 	return physx::PxFilterFlag::eDEFAULT;
 }
 
+void PhysXServerCommandProcessor::onContact(const PxContactPairHeader& pairHeader, const PxContactPair* pairs, PxU32 nbPairs)
+{
+	std::lock_guard<std::recursive_mutex> lock(contacts_lock);
 
+	std::vector<PxContactPairPoint> contacts;
+	for (PxU32 i = 0; i < nbPairs; i++)
+	{
+		PxU32 contactCount = pairs[i].contactCount;
+		if (contactCount)
+		{
+			contacts.resize(contactCount);
+			pairs[i].extractContacts(&contacts[0], contactCount);
+
+			for (PxU32 j = 0; j < contactCount; j++)
+			{
+				std::string namea = pairHeader.actors[0]->getName() == NULL ? std::string() : std::string(pairHeader.actors[0]->getName());
+				std::string nameb = pairHeader.actors[1]->getName() == NULL ? std::string() : std::string(pairHeader.actors[1]->getName());
+				contactPoints.emplace_back(namea, nameb, contacts[j]);
+				// std::cout << "Contact: bw " << pairHeader.actors[0]->getName() << " and " << pairHeader.actors[1]->getName() << " | " << contacts[j].position.x << "," << contacts[j].position.y << ","
+				// 		  << contacts[j].position.z << std::endl;
+			}
+		}
+	}
+}
 
 bool PhysXServerCommandProcessor::connect()
 {
@@ -189,9 +213,9 @@ bool PhysXServerCommandProcessor::connect()
 		sceneDesc.solverType = physx::PxSolverType::eTGS;
 		//sceneDesc.solverType = physx::PxSolverType::ePGS;
 		sceneDesc.cpuDispatcher = m_data->m_dispatcher;
-		//sceneDesc.filterShader = MyPhysXFilter;
-		sceneDesc.filterShader = physx::PxDefaultSimulationFilterShader;
-
+		sceneDesc.filterShader = MyPhysXFilter;
+		// sceneDesc.filterShader = physx::PxDefaultSimulationFilterShader;
+		sceneDesc.simulationEventCallback = this;
 
 		m_data->m_scene = m_data->m_physics->createScene(sceneDesc);
 
@@ -1049,6 +1073,46 @@ bool PhysXServerCommandProcessor::processRequestPhysicsSimulationParametersComma
 	return hasStatus;
 }
 
+bool PhysXServerCommandProcessor::processRequestContactpointInformationCommand(const struct SharedMemoryCommand& clientCmd, struct SharedMemoryStatus& serverStatusOut, char* bufferServerToClient, int bufferSizeInBytes)
+{
+	SharedMemoryStatus& serverCmd = serverStatusOut;
+	int totalBytesPerContact = sizeof(b3ContactPointData);
+	int contactPointStorage = bufferSizeInBytes / totalBytesPerContact - 1;
+
+	b3ContactPointData* contactData = (b3ContactPointData*)bufferServerToClient;
+
+	int startContactPointIndex = clientCmd.m_requestContactPointArguments.m_startingContactPointIndex;
+	std::lock_guard<std::recursive_mutex> lock(contacts_lock);
+	int numContactPointBatch = btMin(int(this->contactPoints.size()), contactPointStorage);
+
+	int endContactPointIndex = startContactPointIndex + numContactPointBatch;
+	serverCmd.m_sendContactPointArgs.m_numContactPointsCopied = 0;
+	for (int i = startContactPointIndex; i < endContactPointIndex; i++)
+	{
+		b3ContactPointData srcPt;
+		PxContactPairPoint contact;
+		std::string ida, idb;
+		std::tie(ida,idb,contact) = this->contactPoints[i]; 
+		srcPt.m_bodyUniqueIdA = ida.empty()? 0 : std::stoi(ida);
+		srcPt.m_bodyUniqueIdB = idb.empty()? 0 : std::stoi(idb);
+		srcPt.m_positionOnAInWS[0] = contact.position.x;
+		srcPt.m_positionOnAInWS[1] = contact.position.y;
+		srcPt.m_positionOnAInWS[2] = contact.position.z;
+		srcPt.m_positionOnBInWS[0] = contact.position.x;
+		srcPt.m_positionOnBInWS[1] = contact.position.y;
+		srcPt.m_positionOnBInWS[2] = contact.position.z;
+		b3ContactPointData& destPt = contactData[serverCmd.m_sendContactPointArgs.m_numContactPointsCopied];
+		destPt = srcPt;
+		serverCmd.m_sendContactPointArgs.m_numContactPointsCopied++;
+	}
+	serverCmd.m_sendContactPointArgs.m_startingContactPointIndex = startContactPointIndex;
+	serverCmd.m_sendContactPointArgs.m_numRemainingContactPoints = this->contactPoints.size() - startContactPointIndex - serverCmd.m_sendContactPointArgs.m_numContactPointsCopied;
+	serverCmd.m_numDataStreamBytes = totalBytesPerContact * serverCmd.m_sendContactPointArgs.m_numContactPointsCopied;
+	serverCmd.m_type = CMD_CONTACT_POINT_INFORMATION_COMPLETED;
+	this->contactPoints.clear();
+
+	return true;
+}
 
 bool PhysXServerCommandProcessor::processCommand(const struct SharedMemoryCommand& clientCmd, struct SharedMemoryStatus& serverStatusOut, char* bufferServerToClient, int bufferSizeInBytes)
 {
@@ -1157,6 +1221,11 @@ bool PhysXServerCommandProcessor::processCommand(const struct SharedMemoryComman
 		case CMD_REQUEST_PHYSICS_SIMULATION_PARAMETERS:
 		{
 			hasStatus = processRequestPhysicsSimulationParametersCommand(clientCmd, serverStatusOut, bufferServerToClient, bufferSizeInBytes);
+			break;
+		}
+		case CMD_REQUEST_CONTACT_POINT_INFORMATION:
+		{
+			hasStatus = processRequestContactpointInformationCommand(clientCmd,serverStatusOut,bufferServerToClient, bufferSizeInBytes);
 			break;
 		}
 
@@ -1319,11 +1388,7 @@ bool PhysXServerCommandProcessor::processCommand(const struct SharedMemoryComman
 			hasStatus = processConfigureOpenGLVisualizerCommand(clientCmd,serverStatusOut,bufferServerToClient, bufferSizeInBytes);
 			break;
 		}
-	case CMD_REQUEST_CONTACT_POINT_INFORMATION:
-		{
-			hasStatus = processRequestContactpointInformationCommand(clientCmd,serverStatusOut,bufferServerToClient, bufferSizeInBytes);
-			break;
-		}
+
 	case CMD_CALCULATE_INVERSE_DYNAMICS:
 		{
 			hasStatus = processInverseDynamicsCommand(clientCmd,serverStatusOut,bufferServerToClient, bufferSizeInBytes);
